@@ -84,14 +84,7 @@ const coreHookTimeout = 30000
 const automaticRestartDelay = 750
 const coreProcessNames = ['mihomo', 'mihomo-alpha', 'mihomo-smart'] as const
 
-// 核心进程状态
-interface CoreProcessWatchdog {
-  process: ChildProcess
-  corePid: number
-}
-
 let child: ChildProcess | null = null
-let coreProcessWatchdog: CoreProcessWatchdog | null = null
 let isRestarting = false
 let coreOperationPhase: 'initializing' | 'ready' | 'blocked' | 'shutting-down' = 'ready'
 let coreOperationTail: Promise<void> = Promise.resolve()
@@ -161,60 +154,6 @@ function runCoreOperation<T>(operation: () => Promise<T>): Promise<T> {
 function cancelAutomaticRestart(): void {
   automaticRestartController?.abort()
   automaticRestartController = null
-}
-
-function stopCoreProcessWatchdog(corePid?: number): void {
-  const watchdog = coreProcessWatchdog
-  if (!watchdog || (corePid !== undefined && watchdog.corePid !== corePid)) return
-
-  coreProcessWatchdog = null
-  if (watchdog.process.pid) {
-    try {
-      process.kill(-watchdog.process.pid, 'SIGKILL')
-    } catch {
-      // The watchdog has already exited.
-    }
-  }
-  watchdog.process.stdin?.destroy()
-}
-
-function startCoreProcessWatchdog(proc: ChildProcess, detached: boolean): void {
-  if (process.platform !== 'linux' || detached || !proc.pid) return
-
-  stopCoreProcessWatchdog()
-
-  const corePid = proc.pid
-  const watchdogProcess = spawn(
-    'sh',
-    ['-c', 'cat >/dev/null; kill -9 "$1" 2>/dev/null', 'mihomo-core-watchdog', `${corePid}`],
-    {
-      stdio: ['pipe', 'ignore', 'ignore'],
-      detached: true
-    }
-  )
-  coreProcessWatchdog = { process: watchdogProcess, corePid }
-
-  const watchdogStdin = watchdogProcess.stdin as typeof watchdogProcess.stdin & {
-    unref?: () => void
-  }
-  watchdogStdin.unref?.()
-  watchdogProcess.unref()
-
-  watchdogProcess.once('error', (error) => {
-    if (coreProcessWatchdog?.process === watchdogProcess) {
-      coreProcessWatchdog = null
-    }
-    watchdogProcess.stdin.destroy()
-    managerLogger.warn('Failed to start core process watchdog', error)
-  })
-  watchdogProcess.once('exit', (code, signal) => {
-    if (coreProcessWatchdog?.process !== watchdogProcess) return
-
-    coreProcessWatchdog = null
-    managerLogger.warn(
-      `Core process watchdog exited unexpectedly, code: ${code}, signal: ${signal}`
-    )
-  })
 }
 
 function shellQuote(value: string): string {
@@ -358,6 +297,31 @@ async function stopPidFileCore(): Promise<void> {
   await rm(pidPath).catch(() => {})
 }
 
+// 记录所有由 Party 启动的 core，不只记录「轻量模式」core。
+//
+// 背景：
+// - 旧实现只在 quitWithoutCore()/keepCoreAlive() 场景写 core.pid；
+// - Linux attached core 额外用一个 watchdog 监听主进程 stdin，主进程异常退出后
+//   watchdog 会 kill -9 mihomo；
+// - 这让 Electron 主进程 crash 时，代理也会被一并杀掉，用户看到的是“APP 崩溃后代理失效”。
+//
+// 新策略：
+// - attached/detached core 都写 core.pid；
+// - 正常退出仍通过 stopCoreForExit()/stopCore() 显式清理；
+// - 异常退出时不再依赖 watchdog 杀 core，让已启动的代理尽量继续服务；
+// - 下次启动时 stopPidFileCore() 会在“新配置已成功生成并校验”之后接管/清理旧 core。
+//
+// 不要轻易恢复旧 watchdog。恢复它会重新引入“主进程崩溃 => core 被杀 => 代理断开”的故障模式。
+async function writeCorePidFile(pid: number | undefined): Promise<void> {
+  if (!pid) return
+
+  try {
+    await writeFile(path.join(dataDir(), 'core.pid'), pid.toString())
+  } catch (error) {
+    managerLogger.warn('Failed to write core pid file', error)
+  }
+}
+
 // 初始化核心文件监听
 export function initCoreWatcher(): void {
   if (coreWatcher) return
@@ -437,8 +401,47 @@ function buildCoreEnv(safePath?: string, ageSecretKey?: string): NodeJS.ProcessE
   return env
 }
 
+// 运行时切换阶段只放“会影响当前 core/系统网络状态”的动作。
+//
+// 这些动作必须和配置生成/校验解耦：
+// - cleanupSocketFile() 可能移除当前 IPC socket；
+// - setPublicDNS() 会修改系统 DNS；
+// - stopCoreInternal() 会杀掉当前 core。
+//
+// 如果在配置校验之前执行这些动作，一份坏配置就能把原本可用的代理打断。
+// 因此 prepareCore() 负责生成和校验，prepareCoreRuntime() 只在确认要切换到新 core 后执行。
+async function prepareCoreRuntime(config: CoreConfig): Promise<void> {
+  await cleanupSocketFile()
+
+  if (config.tunEnabled && config.autoSetDNS) {
+    ensureNotShuttingDown()
+    try {
+      await setPublicDNS()
+    } catch (error) {
+      managerLogger.error('set dns failed', error)
+    }
+    ensureNotShuttingDown()
+  }
+}
+
+interface PrepareCoreOptions {
+  // true 表示只准备“可启动的新 core 配置”，暂不触碰当前运行时。
+  //
+  // restartCore() 使用这个模式实现两阶段切换：
+  //   1. 先 generateProfile + mihomo -t 校验候选配置；
+  //   2. 校验通过后，才停旧 core、清 socket、设置 DNS、启动新 core。
+  //
+  // 这个开关是稳定性边界，不是性能优化。它防止订阅节点改名、override 引用过期等
+  // 配置错误把当前可用 core 先杀掉。
+  deferRuntimeSwitch?: boolean
+}
+
 // 准备核心配置
-async function prepareCore(detached: boolean, skipStop = false): Promise<CoreConfig> {
+async function prepareCore(
+  detached: boolean,
+  skipStop = false,
+  options: PrepareCoreOptions = {}
+): Promise<CoreConfig> {
   await ensureRuntimeFiles()
 
   const [appConfig, mihomoConfig] = await Promise.all([getAppConfig(), getControledMihomoConfig()])
@@ -454,32 +457,16 @@ async function prepareCore(detached: boolean, skipStop = false): Promise<CoreCon
 
   const { 'log-level': logLevel = 'info' as LogLevel, tun } = mihomoConfig
 
-  // 清理轻量模式遗留的后台核心
-  await stopPidFileCore()
-
   // 管理 Smart 内核覆写配置
   await manageSmartOverride()
 
-  // generateProfile 返回实际使用的 current
+  // generateProfile 会把当前 profile/override 合成 work/config.yaml。
+  // checkProfile() 紧随其后做 mihomo -t 语义校验；这一步可能因为代理组引用
+  // 不存在节点而失败。失败时必须只返回错误，不应该影响仍在运行的旧 core。
   const current = await generateProfile()
   const ageSecretKey = (await getProfileItem(current))?.ageSecretKey || ''
   if (testProfileOnStart) {
     await checkProfile(current, core, diffWorkDir, ageSecretKey)
-  }
-  if (!skipStop && hasCoreProcess()) {
-    await stopCoreInternal()
-  }
-  await cleanupSocketFile()
-
-  // 设置 DNS
-  if (tun?.enable && autoSetDNS) {
-    ensureNotShuttingDown()
-    try {
-      await setPublicDNS()
-    } catch (error) {
-      managerLogger.error('set dns failed', error)
-    }
-    ensureNotShuttingDown()
   }
 
   // 获取动态 IPC 路径
@@ -494,7 +481,7 @@ async function prepareCore(detached: boolean, skipStop = false): Promise<CoreCon
   const startupHook =
     !detached && startupMode === 'post-up' ? await createCoreStartupHook() : undefined
 
-  return {
+  const config = {
     corePath: mihomoCorePath(core),
     workDir: diffWorkDir ? mihomoProfileWorkDir(current) : mihomoWorkDir(),
     safePath: diffWorkDir ? mihomoWorkDir() : undefined,
@@ -508,6 +495,21 @@ async function prepareCore(detached: boolean, skipStop = false): Promise<CoreCon
     startupMode,
     startupHook
   }
+
+  if (!options.deferRuntimeSwitch) {
+    if (!skipStop && hasCoreProcess()) {
+      // 普通 startCore() 语义保持不变：启动前先停止已有 child。
+      // restartCore() 不走这里，它会先 deferRuntimeSwitch 完成候选配置校验。
+      await stopCoreInternal()
+    } else {
+      // 清理轻量模式或上次异常退出遗留的后台核心。必须在配置校验通过之后执行，
+      // 避免新配置坏掉时杀死仍可用的旧核心。
+      await stopPidFileCore()
+    }
+    await prepareCoreRuntime(config)
+  }
+
+  return config
 }
 
 // 启动核心进程
@@ -610,7 +612,6 @@ function setupCoreListeners(
 
   proc.on('close', async (code, signal) => {
     managerLogger.info(`Core closed, code: ${code}, signal: ${signal}`)
-    stopCoreProcessWatchdog(proc.pid)
 
     if (child === proc) {
       child = null
@@ -735,14 +736,20 @@ interface CoreStartAttempt {
 async function startCoreInternal(detached = false, skipStop = false): Promise<CoreStartAttempt> {
   ensureNotShuttingDown()
   const config = await prepareCore(detached, skipStop)
+  return startPreparedCore(config)
+}
+
+async function startPreparedCore(config: CoreConfig): Promise<CoreStartAttempt> {
   ensureNotShuttingDown()
   const hookWaiter = config.startupHook ? createCoreHookWaiter(config.startupHook) : undefined
   const proc = spawnCoreProcess(config)
   hookWaiter?.attachProcess(proc)
   child = proc
-  startCoreProcessWatchdog(proc, detached)
+  // 见 writeCorePidFile() 的注释：pid 文件现在是异常退出后的接管边界。
+  // 它替代了 Linux watchdog 的“主进程退出即杀 core”策略。
+  await writeCorePidFile(proc.pid)
 
-  if (detached) {
+  if (config.detached) {
     managerLogger.info(
       `Core process detached successfully on ${process.platform}, PID: ${proc.pid}`
     )
@@ -818,8 +825,6 @@ function stopCoreProcessAndStreams(cancelStartup = true): void {
     child = null
   }
 
-  stopCoreProcessWatchdog()
-
   stopMihomoTraffic()
   stopMihomoConnections()
   stopMihomoLogs()
@@ -858,8 +863,19 @@ setStopCoreBeforeAdminRestart(stopCore)
 
 async function restartCoreOnce(forceStop: boolean): Promise<void> {
   const startAttempt = await runCoreOperation(async () => {
+    // 两阶段重启，顺序不能反过来：
+    //
+    // 旧实现是 stop old core -> generate/check new config -> start new core。
+    // 这个顺序在配置错误时会直接断网：旧 core 已经被 SIGINT，新 core 因 mihomo -t
+    // 失败无法启动。典型错误是订阅节点改名后，override/proxy-group 仍引用旧节点名：
+    //   proxy group[0]: 自动选择: 'xxx' not found
+    //
+    // 新实现先准备并校验候选配置。只有候选配置通过后，才真正停旧 core 并切换运行时。
+    // 这样配置失败会暴露给 UI/日志，但当前代理继续运行。
+    const config = await prepareCore(false, true, { deferRuntimeSwitch: true })
     await stopCoreInternal(forceStop)
-    return startCoreInternal(false, true)
+    await prepareCoreRuntime(config)
+    return startPreparedCore(config)
   })
   await startAttempt.readiness
 }
@@ -906,9 +922,6 @@ export function restartCore(forceStop = false): Promise<void> {
 export async function keepCoreAlive(): Promise<boolean> {
   try {
     await startCore(true)
-    if (child?.pid) {
-      await writeFile(path.join(dataDir(), 'core.pid'), child.pid.toString())
-    }
     return Boolean(child?.pid)
   } catch (e) {
     safeShowErrorBox('mihomo.error.coreStartFailed', `${e}`)
