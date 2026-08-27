@@ -24,6 +24,9 @@ const validInvokeChannels = [
   'patchMihomoConfig',
   'mihomoSmartGroupWeights',
   'mihomoSmartFlushCache',
+  'getAutoProxySwitchState',
+  'restartAutoProxySwitch',
+  'runAutoProxySwitchCheck',
   // AutoRun
   'checkAutoRun',
   'enableAutoRun',
@@ -179,7 +182,8 @@ const validListenChannels = [
   'rulesUpdated',
   'updateDownloadProgress',
   'pluginConfigUpdated',
-  'openPluginFile'
+  'openPluginFile',
+  'autoProxySwitchUpdated'
 ] as const
 
 // 允许的 send channels 白名单

@@ -37,6 +37,11 @@ interface IpcApi {
   mihomoSmartGroupWeights: (groupName: string) => Promise<Record<string, number>>
   mihomoSmartFlushCache: (configName?: string) => Promise<void>
   getSmartOverrideContent: () => Promise<string | null>
+  getAutoProxySwitchState: () => Promise<IProxyAutoSwitchState>
+  restartAutoProxySwitch: () => Promise<IProxyAutoSwitchState>
+  runAutoProxySwitchCheck: (
+    reason?: 'manual' | 'active' | 'standby'
+  ) => Promise<IProxyAutoSwitchState>
   // AutoRun
   checkAutoRun: () => Promise<boolean>
   enableAutoRun: () => Promise<void>
@@ -209,6 +214,9 @@ export const {
   mihomoSmartGroupWeights,
   mihomoSmartFlushCache,
   getSmartOverrideContent,
+  getAutoProxySwitchState,
+  restartAutoProxySwitch,
+  runAutoProxySwitchCheck,
   // AutoRun
   checkAutoRun,
   enableAutoRun,

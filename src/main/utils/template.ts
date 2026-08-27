@@ -55,6 +55,22 @@ export const defaultConfig: IAppConfig = {
   gistAgeRecipient: '',
   gistAgeSecretKey: '',
   networkLatencyTargets: [],
+  proxyAutoSwitch: {
+    enabled: false,
+    targetGroup: '',
+    activeIntervalSec: 15,
+    standbyIntervalSec: 300,
+    switchCooldownSec: 180,
+    maxDelayMs: 800,
+    failureThreshold: 2,
+    closeConnectionsOnSwitch: true,
+    regions: [
+      { id: 'us', name: '美国', patterns: ['US', '美国', 'United States'], enabled: true },
+      { id: 'jp', name: '日本', patterns: ['JP', '日本', 'Japan'], enabled: true },
+      { id: 'sg', name: '新加坡', patterns: ['SG', '新加坡', 'Singapore'], enabled: true },
+      { id: 'hk', name: '香港', patterns: ['HK', '香港', 'Hong Kong'], enabled: true }
+    ]
+  },
   networkInfoCardOrder: DEFAULT_NETWORK_INFO_CARD_ORDER,
   useNameserverPolicy: DEFAULT_USE_NAMESERVER_POLICY,
   controlDns: DEFAULT_CONTROL_DNS,

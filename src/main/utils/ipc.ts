@@ -4,6 +4,11 @@ import { readFile } from 'fs/promises'
 import { app, ipcMain } from 'electron'
 import i18next from 'i18next'
 import {
+  getAutoProxySwitchState,
+  restartAutoProxySwitch,
+  runAutoProxySwitchCheck
+} from '../core/autoProxySwitch'
+import {
   mihomoChangeProxy,
   mihomoCloseAllConnections,
   mihomoCloseConnection,
@@ -252,6 +257,9 @@ const asyncHandlers: Record<string, AsyncFn> = {
   patchMihomoConfig,
   mihomoSmartGroupWeights,
   mihomoSmartFlushCache,
+  getAutoProxySwitchState: async () => getAutoProxySwitchState(),
+  restartAutoProxySwitch,
+  runAutoProxySwitchCheck,
   // AutoRun
   checkAutoRun,
   enableAutoRun,

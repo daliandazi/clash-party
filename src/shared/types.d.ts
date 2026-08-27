@@ -258,6 +258,59 @@ interface INetworkLatencyTarget {
   url: string
 }
 
+interface IProxyAutoSwitchRegion {
+  id: string
+  name: string
+  patterns: string[]
+  enabled: boolean
+}
+
+interface IProxyAutoSwitchConfig {
+  enabled: boolean
+  targetGroup?: string
+  activeIntervalSec: number
+  standbyIntervalSec: number
+  switchCooldownSec: number
+  maxDelayMs: number
+  failureThreshold: number
+  closeConnectionsOnSwitch: boolean
+  regions: IProxyAutoSwitchRegion[]
+}
+
+interface IProxyAutoSwitchDelayEntry {
+  delay: number
+  time: string
+  alive: boolean
+  error?: string
+}
+
+interface IProxyAutoSwitchBucket {
+  id: string
+  name: string
+  proxies: string[]
+}
+
+interface IProxyAutoSwitchState {
+  running: boolean
+  paused: boolean
+  checkingActive: boolean
+  checkingStandby: boolean
+  currentGroup?: string
+  currentProxy?: string
+  currentRegion?: string
+  lastActiveCheckAt?: string
+  lastStandbyCheckAt?: string
+  nextActiveCheckAt?: string
+  nextStandbyCheckAt?: string
+  lastSwitchAt?: string
+  lastSwitchReason?: string
+  consecutiveFailures: Record<string, number>
+  lastDelays: Record<string, IProxyAutoSwitchDelayEntry>
+  buckets: IProxyAutoSwitchBucket[]
+  unknownProxies: string[]
+  lastError?: string
+}
+
 interface ICustomTrayIcons {
   off?: string
   sysProxy?: string
@@ -363,6 +416,7 @@ interface IAppConfig {
   delayTestUrl?: string
   delayTestTimeout?: number
   networkLatencyTargets?: INetworkLatencyTarget[]
+  proxyAutoSwitch?: IProxyAutoSwitchConfig
   networkIPProvider?: 'ip.sb' | 'ipwho.is' | 'ipapi.is'
   networkInfoCardOrder?: NetworkInfoCardKey[]
   subscriptionTimeout?: number

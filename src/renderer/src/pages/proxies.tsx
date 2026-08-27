@@ -13,10 +13,12 @@ import {
 import BasePage from '@renderer/components/base/base-page'
 import { useAppConfig } from '@renderer/hooks/use-app-config'
 import {
+  getAutoProxySwitchState,
   getImageDataURL,
   mihomoChangeProxy,
   mihomoCloseAllConnections,
-  mihomoProxyDelay
+  mihomoProxyDelay,
+  runAutoProxySwitchCheck
 } from '@renderer/utils/ipc'
 import { FaLocationCrosshairs } from 'react-icons/fa6'
 import { CgDetailsLess, CgDetailsMore } from 'react-icons/cg'
@@ -32,6 +34,8 @@ import {
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import { GroupedVirtuoso, GroupedVirtuosoHandle } from 'react-virtuoso'
 import ProxyItem from '@renderer/components/proxies/proxy-item'
+import AutoSwitchModal from '@renderer/components/proxies/auto-switch-modal'
+import AutoSwitchStatus from '@renderer/components/proxies/auto-switch-status'
 import { IoIosArrowBack } from 'react-icons/io'
 import { useGroups } from '@renderer/hooks/use-groups'
 import CollapseInput from '@renderer/components/base/collapse-input'
@@ -158,6 +162,9 @@ const Proxies: React.FC = () => {
   } = appConfig || {}
 
   const [cols, setCols] = useState(1)
+  const [isAutoSwitchOpen, setIsAutoSwitchOpen] = useState(false)
+  const [autoSwitchState, setAutoSwitchState] = useState<IProxyAutoSwitchState>()
+  const [autoSwitchChecking, setAutoSwitchChecking] = useState(false)
   const { virtuosoRef, isOpen, setIsOpen } = useProxyState(groupData)
   const [delaying, setDelaying] = useState<Set<string>[]>(() =>
     Array.from({ length: groups.length }, () => new Set<string>())
@@ -177,6 +184,17 @@ const Proxies: React.FC = () => {
       return Array.from({ length: groups.length }, (_, i) => prev[i] ?? new Set<string>())
     })
   }, [groups.length])
+
+  useEffect(() => {
+    getAutoProxySwitchState().then(setAutoSwitchState).catch(console.error)
+    const handler = (_event: unknown, nextState: unknown): void => {
+      setAutoSwitchState(nextState as IProxyAutoSwitchState)
+    }
+    window.electron.ipcRenderer.on('autoProxySwitchUpdated', handler)
+    return () => {
+      window.electron.ipcRenderer.removeListener('autoProxySwitchUpdated', handler)
+    }
+  }, [])
 
   // 代理列表排序
   const sortProxies = useCallback((proxies: (IMihomoProxy | IMihomoGroup)[], order: string) => {
@@ -332,6 +350,37 @@ const Proxies: React.FC = () => {
     if (flushDelayTimer.current) return
     flushDelayTimer.current = setTimeout(flushDelayResults, 200)
   }, [flushDelayResults])
+
+  const mergeAutoSwitchDelayResults = useCallback(
+    (nextState: IProxyAutoSwitchState): void => {
+      if (!nextState.currentGroup) return
+      const group = groups.find((item) => item.name === nextState.currentGroup)
+      if (!group) return
+
+      const proxyNames = new Set(group.all.map((proxy) => proxy.name))
+      const groupResults = new Map<string, { time: string; delay: number }>()
+      Object.entries(nextState.lastDelays).forEach(([name, entry]) => {
+        if (!proxyNames.has(name)) return
+        groupResults.set(name, { time: entry.time, delay: entry.delay })
+      })
+      if (groupResults.size === 0) return
+
+      pendingDelayResults.current.set(group.name, groupResults)
+      flushDelayResults()
+    },
+    [flushDelayResults, groups]
+  )
+
+  const onRunAutoSwitchCheck = useCallback(async (): Promise<void> => {
+    setAutoSwitchChecking(true)
+    try {
+      const nextState = await runAutoProxySwitchCheck('manual')
+      setAutoSwitchState(nextState)
+      mergeAutoSwitchDelayResults(nextState)
+    } finally {
+      setAutoSwitchChecking(false)
+    }
+  }, [mergeAutoSwitchDelayResults])
 
   useEffect(() => {
     return (): void => {
@@ -689,6 +738,9 @@ const Proxies: React.FC = () => {
                 case 'mode-full':
                   void patchAppConfig({ proxyDisplayMode: 'full' })
                   break
+                case 'auto-switch':
+                  setIsAutoSwitchOpen(true)
+                  break
               }
             }}
           >
@@ -771,33 +823,63 @@ const Proxies: React.FC = () => {
                 {t('proxies.mode.full')}
               </DropdownItem>
             </DropdownSection>
+            <DropdownSection title={t('proxies.autoSwitch.title')}>
+              <DropdownItem
+                key="auto-switch"
+                startContent={<MdOutlineSpeed className="text-lg" />}
+                endContent={
+                  appConfig?.proxyAutoSwitch?.enabled ? (
+                    <MdCheck className="text-lg text-primary" />
+                  ) : null
+                }
+              >
+                {t('proxies.autoSwitch.title')}
+              </DropdownItem>
+            </DropdownSection>
           </DropdownMenu>
         </Dropdown>
       }
     >
-      {mode === 'direct' ? (
-        <div className="h-full w-full flex justify-center items-center">
-          <div className="flex flex-col items-center">
-            <MdDoubleArrow className="text-foreground-500 text-[100px]" />
-            <h2 className="text-foreground-500 text-[20px]">{t('proxies.mode.direct')}</h2>
+      <>
+        {mode === 'direct' ? (
+          <div className="h-full w-full flex justify-center items-center">
+            <div className="flex flex-col items-center">
+              <MdDoubleArrow className="text-foreground-500 text-[100px]" />
+              <h2 className="text-foreground-500 text-[20px]">{t('proxies.mode.direct')}</h2>
+            </div>
           </div>
-        </div>
-      ) : (
-        <div className="h-[calc(100vh-50px)]">
-          {/* Reset Virtuoso's measured sizes after toggling unavailable proxy filtering. */}
-          <GroupedVirtuoso
-            key={appConfig?.hideUnavailableProxies ? 'hide-unavailable' : 'show-unavailable'}
-            ref={virtuosoRef}
-            groupCounts={groupCounts}
-            defaultItemHeight={80}
-            increaseViewportBy={{ top: 150, bottom: 150 }}
-            overscan={200}
-            computeItemKey={(index, groupIndex) => `${groupIndex}-${index}`}
-            groupContent={renderGroupContent}
-            itemContent={renderItemContent}
-          />
-        </div>
-      )}
+        ) : (
+          <div className="flex h-[calc(100vh-50px)] flex-col">
+            <AutoSwitchStatus
+              enabled={appConfig?.proxyAutoSwitch?.enabled}
+              state={autoSwitchState}
+              isChecking={autoSwitchChecking}
+              onOpenSettings={() => setIsAutoSwitchOpen(true)}
+              onRunCheck={onRunAutoSwitchCheck}
+            />
+            {/* Reset Virtuoso's measured sizes after toggling unavailable proxy filtering. */}
+            <div className="min-h-0 flex-1">
+              <GroupedVirtuoso
+                key={appConfig?.hideUnavailableProxies ? 'hide-unavailable' : 'show-unavailable'}
+                ref={virtuosoRef}
+                style={{ height: '100%' }}
+                groupCounts={groupCounts}
+                defaultItemHeight={80}
+                increaseViewportBy={{ top: 150, bottom: 150 }}
+                overscan={200}
+                computeItemKey={(index, groupIndex) => `${groupIndex}-${index}`}
+                groupContent={renderGroupContent}
+                itemContent={renderItemContent}
+              />
+            </div>
+          </div>
+        )}
+        <AutoSwitchModal
+          isOpen={isAutoSwitchOpen}
+          onOpenChange={setIsAutoSwitchOpen}
+          groups={groups}
+        />
+      </>
     </BasePage>
   )
 }
