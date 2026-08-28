@@ -19,6 +19,10 @@ function formatDelay(state?: IProxyAutoSwitchState): string | undefined {
   return entry.alive ? `${entry.delay}ms` : 'Timeout'
 }
 
+function recoveryActionKey(action: ProxyAutoSwitchRecoveryAction): string {
+  return `proxies.autoSwitch.recovery.${action}`
+}
+
 const AutoSwitchStatus: React.FC<AutoSwitchStatusProps> = (props) => {
   const { state, enabled, onOpenSettings, onRunCheck, isChecking = false } = props
   const { t } = useTranslation()
@@ -60,6 +64,17 @@ const AutoSwitchStatus: React.FC<AutoSwitchStatusProps> = (props) => {
             {delay ? (
               <span className="text-foreground-500">
                 {t('proxies.autoSwitch.lastDelay')}: {delay}
+              </span>
+            ) : null}
+            {state?.excludedProxies?.length ? (
+              <span className="text-foreground-500">
+                {t('proxies.autoSwitch.excluded')}: {state.excludedProxies.length}
+              </span>
+            ) : null}
+            {state?.lastRecoveryAction ? (
+              <span className="text-foreground-500">
+                {t('proxies.autoSwitch.lastRecovery')}:{' '}
+                {t(recoveryActionKey(state.lastRecoveryAction))}
               </span>
             ) : null}
             {state?.lastError ? <span className="text-warning">{state.lastError}</span> : null}

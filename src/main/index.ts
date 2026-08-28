@@ -21,6 +21,7 @@ import { createTray } from './resolve/tray'
 import { init, initBasic, safeShowErrorBox, startSubStoreServices } from './utils/init'
 import { initShortcut } from './resolve/shortcut'
 import { startAutoProxySwitch, stopAutoProxySwitch } from './core/autoProxySwitch'
+import { startRuntimeDiagnostics, stopRuntimeDiagnostics } from './core/runtimeHealth'
 import { initProfileUpdater } from './core/profileUpdater'
 import { startMonitor } from './resolve/trafficMonitor'
 import { showFloatingWindow } from './resolve/floatingWindow'
@@ -351,6 +352,9 @@ app
               startAutoProxySwitch().catch((e) =>
                 mainLogger.warn('Failed to init auto proxy switch', e)
               ),
+              startRuntimeDiagnostics().catch((e) =>
+                mainLogger.warn('Failed to start runtime diagnostics', e)
+              ),
               checkAdminRestartForTun().catch((e) =>
                 mainLogger.warn('Failed admin-restart-for-tun follow-up', e)
               )
@@ -431,6 +435,7 @@ app
 
     app.on('before-quit', () => {
       stopAutoProxySwitch()
+      stopRuntimeDiagnostics()
     })
   })
   .catch((error) => {

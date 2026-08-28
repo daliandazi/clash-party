@@ -59,6 +59,32 @@ describe('autoProxySwitch pure functions', () => {
     expect(value.regions.length).toBeGreaterThan(0)
   })
 
+  it('normalizes recovery probing options and excluded proxy patterns', () => {
+    const value = normalizeAutoSwitchConfig({
+      delayConcurrency: 99,
+      retryTimeoutOnce: false,
+      excludePatterns: [' HK ', '', '/倍率/i']
+    })
+
+    expect(value.delayConcurrency).toBe(20)
+    expect(value.retryTimeoutOnce).toBe(false)
+    expect(value.excludePatterns).toEqual(['HK', '/倍率/i'])
+  })
+
+  it('normalizes invalid region entries without throwing', () => {
+    const value = normalizeAutoSwitchConfig({
+      regions: [
+        null,
+        {},
+        { id: 'custom', patterns: [' US ', ''] }
+      ] as unknown as IProxyAutoSwitchRegion[]
+    })
+
+    expect(value.regions).toEqual([
+      { id: 'custom', name: 'custom', patterns: ['US'], enabled: true }
+    ])
+  })
+
   it('classifies proxy by keyword using region priority', () => {
     expect(classifyProxyRegion('US-01 日本备份', config.regions)?.id).toBe('us')
   })
@@ -92,6 +118,27 @@ describe('autoProxySwitch pure functions', () => {
     expect(result.candidates.find((item) => item.name === 'US-01')?.provider).toBe('provider-a')
     expect(result.buckets.find((item) => item.id === 'us')?.proxies).toContain('US-01')
     expect(result.unknownProxies).toEqual(['Premium-01'])
+  })
+
+  it('excludes proxies before region bucketing', () => {
+    const result = buildRegionBuckets(
+      [{ name: 'US-01' }, { name: 'US-HK-relay' }, { name: 'JP-5x' }],
+      config.regions,
+      ['HK', '/5x/i']
+    )
+
+    expect(result.candidates.map((item) => item.name)).toEqual(['US-01'])
+    expect(result.excludedProxies).toEqual([
+      { name: 'US-HK-relay', pattern: 'HK' },
+      { name: 'JP-5x', pattern: '/5x/i' }
+    ])
+  })
+
+  it('ignores invalid exclusion regex without excluding everything', () => {
+    const result = buildRegionBuckets([{ name: 'US-01' }], config.regions, ['/[abc/'])
+
+    expect(result.candidates.map((item) => item.name)).toEqual(['US-01'])
+    expect(result.excludedProxies).toEqual([])
   })
 
   it('chooses the lowest delay in the highest-priority usable region', () => {
@@ -192,6 +239,9 @@ describe('autoProxySwitch service decisions', () => {
     maxDelayMs: 800,
     failureThreshold: 2,
     closeConnectionsOnSwitch: true,
+    delayConcurrency: 4,
+    retryTimeoutOnce: true,
+    excludePatterns: [],
     regions: [
       { id: 'us', name: '美国', patterns: ['US'], enabled: true },
       { id: 'jp', name: '日本', patterns: ['JP'], enabled: true }
@@ -256,6 +306,118 @@ describe('autoProxySwitch service decisions', () => {
     await service.runCheck('active')
 
     expect(deps.mihomoChangeProxy).toHaveBeenCalledWith('PROXY', 'JP-01')
+  })
+
+  it('retries a timed-out candidate once before deciding it is unusable', async () => {
+    deps.getAppConfig.mockResolvedValue({
+      proxyAutoSwitch: { ...baseConfig, retryTimeoutOnce: true, delayConcurrency: 4 },
+      delayTestConcurrency: 50
+    })
+    deps.mihomoProxyDelay.mockImplementation(async (name: string) => {
+      if (name === 'US-01') return { delay: 1200 }
+      if (name === 'US-02') {
+        const attempts = deps.mihomoProxyDelay.mock.calls.filter(
+          ([proxyName]) => proxyName === 'US-02'
+        )
+        return { delay: attempts.length === 1 ? 0 : 100 }
+      }
+      return { delay: 0 }
+    })
+    const service = createAutoProxySwitchService(deps)
+
+    await service.runCheck('active')
+    await service.runCheck('active')
+
+    expect(deps.mihomoChangeProxy).toHaveBeenCalledWith('PROXY', 'US-02')
+  })
+
+  it('does not retry the active proxy health check so failover is not delayed', async () => {
+    deps.getAppConfig.mockResolvedValue({
+      proxyAutoSwitch: { ...baseConfig, failureThreshold: 1, retryTimeoutOnce: true },
+      delayTestConcurrency: 50
+    })
+    deps.mihomoProxyDelay.mockImplementation(async (name: string) => {
+      if (name === 'US-01') {
+        const attempts = deps.mihomoProxyDelay.mock.calls.filter(
+          ([proxyName]) => proxyName === 'US-01'
+        )
+        return { delay: attempts.length === 1 ? 0 : 100 }
+      }
+      if (name === 'US-02') return { delay: 100 }
+      return { delay: 0 }
+    })
+    const service = createAutoProxySwitchService(deps)
+
+    await service.runCheck('active')
+
+    expect(deps.mihomoChangeProxy).toHaveBeenCalledWith('PROXY', 'US-02')
+    expect(deps.mihomoProxyDelay.mock.calls.filter(([name]) => name === 'US-01')).toHaveLength(1)
+  })
+
+  it('does not retry candidates when retryTimeoutOnce is disabled', async () => {
+    deps.getAppConfig.mockResolvedValue({
+      proxyAutoSwitch: { ...baseConfig, failureThreshold: 1, retryTimeoutOnce: false },
+      delayTestConcurrency: 50
+    })
+    deps.mihomoProxyDelay.mockImplementation(async (name: string) => {
+      if (name === 'US-01') return { delay: 1200 }
+      if (name === 'US-02') {
+        const attempts = deps.mihomoProxyDelay.mock.calls.filter(
+          ([proxyName]) => proxyName === 'US-02'
+        )
+        return { delay: attempts.length === 1 ? 0 : 100 }
+      }
+      return { delay: 0 }
+    })
+    const service = createAutoProxySwitchService(deps)
+
+    await service.runCheck('active')
+
+    expect(deps.mihomoChangeProxy).not.toHaveBeenCalled()
+    expect(deps.mihomoProxyDelay.mock.calls.filter(([name]) => name === 'US-02')).toHaveLength(1)
+  })
+
+  it('does not retry candidates that responded above the delay threshold', async () => {
+    deps.getAppConfig.mockResolvedValue({
+      proxyAutoSwitch: { ...baseConfig, failureThreshold: 1, retryTimeoutOnce: true },
+      delayTestConcurrency: 50
+    })
+    deps.mihomoProxyDelay.mockImplementation(async (name: string) => {
+      if (name === 'US-01') return { delay: 1200 }
+      if (name === 'US-02') return { delay: 1200 }
+      return { delay: 0 }
+    })
+    const service = createAutoProxySwitchService(deps)
+
+    await service.runCheck('active')
+
+    expect(deps.mihomoChangeProxy).not.toHaveBeenCalled()
+    expect(deps.mihomoProxyDelay.mock.calls.filter(([name]) => name === 'US-02')).toHaveLength(1)
+  })
+
+  it('uses auto-switch delayConcurrency instead of global manual delay concurrency', async () => {
+    deps.getAppConfig.mockResolvedValue({
+      proxyAutoSwitch: { ...baseConfig, delayConcurrency: 1 },
+      delayTestConcurrency: 50
+    })
+    deps.mihomoGroups.mockResolvedValue([
+      group('US-01', [proxy('US-01'), proxy('US-02'), proxy('JP-01')])
+    ])
+    let inFlight = 0
+    let maxInFlight = 0
+    deps.mihomoProxyDelay.mockImplementation(async () => {
+      inFlight += 1
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      inFlight -= 1
+      return { delay: 100 }
+    })
+    const service = createAutoProxySwitchService(deps)
+
+    await service.runCheck('standby')
+
+    expect(deps.mihomoProxyDelay).toHaveBeenCalledTimes(3)
+    expect(maxInFlight).toBe(1)
   })
 
   it('does not switch while in cooldown', async () => {
@@ -350,5 +512,33 @@ describe('autoProxySwitch service decisions', () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
 
     expect(setTimer).not.toHaveBeenCalled()
+  })
+
+  it('does not let an old active timer reschedule after restart', async () => {
+    let resolveDelay: (value: IMihomoDelay) => void = () => {}
+    const setTimer = vi.fn((handler: () => void) => {
+      return handler
+    })
+    const clearTimer = vi.fn()
+    deps.mihomoProxyDelay.mockReturnValue(
+      new Promise<IMihomoDelay>((resolve) => {
+        resolveDelay = resolve
+      })
+    )
+    const service = createAutoProxySwitchService({ ...deps, setTimer, clearTimer })
+
+    await service.start()
+    const oldActiveHandler = setTimer.mock.calls[0][0]
+    oldActiveHandler()
+    await Promise.resolve()
+    await Promise.resolve()
+    setTimer.mockClear()
+    await service.restart()
+    const timersScheduledByRestart = setTimer.mock.calls.length
+
+    resolveDelay({ delay: 100 })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(setTimer).toHaveBeenCalledTimes(timersScheduledByRestart)
   })
 })

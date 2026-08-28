@@ -44,6 +44,9 @@ export const DEFAULT_AUTO_SWITCH_CONFIG: IProxyAutoSwitchConfig = {
   maxDelayMs: 800,
   failureThreshold: 2,
   closeConnectionsOnSwitch: true,
+  delayConcurrency: 4,
+  retryTimeoutOnce: true,
+  excludePatterns: [],
   regions: [
     { id: 'us', name: '美国', patterns: ['US', '美国', 'United States'], enabled: true },
     { id: 'jp', name: '日本', patterns: ['JP', '日本', 'Japan'], enabled: true },
@@ -57,22 +60,36 @@ const MIN_STANDBY_INTERVAL_SEC = 30
 const MIN_SWITCH_COOLDOWN_SEC = 30
 const MIN_FAILURE_THRESHOLD = 1
 const MIN_MAX_DELAY_MS = 1
+const MIN_DELAY_CONCURRENCY = 1
+const MAX_DELAY_CONCURRENCY = 20
 
 function cloneDefaultConfig(): IProxyAutoSwitchConfig {
   return JSON.parse(JSON.stringify(DEFAULT_AUTO_SWITCH_CONFIG)) as IProxyAutoSwitchConfig
 }
 
-function clampNumber(value: unknown, fallback: number, min: number): number {
+function clampNumber(value: unknown, fallback: number, min: number, max?: number): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
-  return Math.max(Math.floor(value), min)
+  const clamped = Math.max(Math.floor(value), min)
+  return typeof max === 'number' ? Math.min(clamped, max) : clamped
 }
 
 export function normalizeAutoSwitchConfig(
   value?: Partial<IProxyAutoSwitchConfig>
 ): IProxyAutoSwitchConfig {
   const defaults = cloneDefaultConfig()
-  const regions =
+  const rawRegions =
     Array.isArray(value?.regions) && value.regions.length > 0 ? value.regions : defaults.regions
+  const regions = rawRegions
+    .filter((region): region is IProxyAutoSwitchRegion => Boolean(region))
+    .map((region) => ({
+      id: String(region.id || '').trim(),
+      name: String(region.name || region.id || '').trim(),
+      patterns: Array.isArray(region.patterns)
+        ? region.patterns.map((pattern) => String(pattern).trim()).filter(Boolean)
+        : [],
+      enabled: region.enabled !== false
+    }))
+    .filter((region) => region.id && region.name)
 
   return {
     ...defaults,
@@ -101,14 +118,17 @@ export function normalizeAutoSwitchConfig(
       MIN_FAILURE_THRESHOLD
     ),
     closeConnectionsOnSwitch: value?.closeConnectionsOnSwitch !== false,
-    regions: regions.map((region) => ({
-      id: String(region.id || '').trim(),
-      name: String(region.name || region.id || '').trim(),
-      patterns: Array.isArray(region.patterns)
-        ? region.patterns.map((pattern) => String(pattern).trim()).filter(Boolean)
-        : [],
-      enabled: region.enabled !== false
-    }))
+    delayConcurrency: clampNumber(
+      value?.delayConcurrency,
+      defaults.delayConcurrency,
+      MIN_DELAY_CONCURRENCY,
+      MAX_DELAY_CONCURRENCY
+    ),
+    retryTimeoutOnce: value?.retryTimeoutOnce !== false,
+    excludePatterns: Array.isArray(value?.excludePatterns)
+      ? value.excludePatterns.map((pattern) => String(pattern).trim()).filter(Boolean)
+      : defaults.excludePatterns,
+    regions: regions.length > 0 ? regions : defaults.regions
   }
 }
 
@@ -143,17 +163,27 @@ export function classifyProxyRegion(
   return undefined
 }
 
+function matchPattern(value: string, patterns: string[]): string | undefined {
+  for (const pattern of patterns) {
+    const regex = compilePattern(pattern)
+    if (regex?.test(value)) return pattern
+  }
+  return undefined
+}
+
 export function isDelayUsable(delay: number | undefined, maxDelayMs: number): boolean {
   return typeof delay === 'number' && delay > 0 && delay <= maxDelayMs
 }
 
 export function buildRegionBuckets(
   proxies: { name: string; provider?: string }[],
-  regions: IProxyAutoSwitchRegion[]
+  regions: IProxyAutoSwitchRegion[],
+  excludePatterns: string[] = []
 ): {
   candidates: AutoSwitchCandidateProxy[]
   buckets: IProxyAutoSwitchBucket[]
   unknownProxies: string[]
+  excludedProxies: IProxyAutoSwitchExcludedProxy[]
 } {
   const enabledRegions = regions.filter((region) => region.enabled)
   const buckets: IProxyAutoSwitchBucket[] = enabledRegions.map((region) => ({
@@ -164,8 +194,15 @@ export function buildRegionBuckets(
   const bucketMap = new Map(buckets.map((bucket) => [bucket.id, bucket]))
   const candidates: AutoSwitchCandidateProxy[] = []
   const unknownProxies: string[] = []
+  const excludedProxies: IProxyAutoSwitchExcludedProxy[] = []
 
   proxies.forEach((proxy) => {
+    const excludedBy = matchPattern(proxy.name, excludePatterns)
+    if (excludedBy) {
+      excludedProxies.push({ name: proxy.name, pattern: excludedBy })
+      return
+    }
+
     const region = classifyProxyRegion(proxy.name, enabledRegions)
     if (!region) {
       unknownProxies.push(proxy.name)
@@ -176,7 +213,7 @@ export function buildRegionBuckets(
     candidates.push({ ...proxy, regionId: region.id })
   })
 
-  return { candidates, buckets, unknownProxies }
+  return { candidates, buckets, unknownProxies, excludedProxies }
 }
 
 export function chooseBestCandidate(
@@ -207,7 +244,8 @@ function initialState(): IProxyAutoSwitchState {
     consecutiveFailures: {},
     lastDelays: {},
     buckets: [],
-    unknownProxies: []
+    unknownProxies: [],
+    excludedProxies: []
   }
 }
 
@@ -217,7 +255,8 @@ function cloneState(state: IProxyAutoSwitchState): IProxyAutoSwitchState {
     consecutiveFailures: { ...state.consecutiveFailures },
     lastDelays: { ...state.lastDelays },
     buckets: state.buckets.map((bucket) => ({ ...bucket, proxies: [...bucket.proxies] })),
-    unknownProxies: [...state.unknownProxies]
+    unknownProxies: [...state.unknownProxies],
+    excludedProxies: state.excludedProxies?.map((item) => ({ ...item }))
   }
 }
 
@@ -287,12 +326,14 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
   stop: () => IProxyAutoSwitchState
   restart: () => Promise<IProxyAutoSwitchState>
   runCheck: (reason?: AutoProxySwitchCheckReason) => Promise<IProxyAutoSwitchState>
+  recordRecovery: (action: ProxyAutoSwitchRecoveryAction, at?: Date) => IProxyAutoSwitchState
 } {
   let state = initialState()
   let activeTimer: AutoSwitchTimer | undefined
   let standbyTimer: AutoSwitchTimer | undefined
   let checkingActive = false
   let checkingStandby = false
+  let timerGeneration = 0
   const now = deps.now ?? (() => new Date())
   const setTimer = deps.setTimer ?? setTimeout
   const clearTimer = deps.clearTimer ?? clearTimeout
@@ -343,7 +384,11 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
     const rawCandidates = group.all
       .map(toCandidateProxy)
       .filter(Boolean) as AutoSwitchCandidateProxy[]
-    const bucketResult = buildRegionBuckets(rawCandidates, configValue.regions)
+    const bucketResult = buildRegionBuckets(
+      rawCandidates,
+      configValue.regions,
+      configValue.excludePatterns
+    )
     const candidates = bucketResult.candidates
     const current = candidates.find((candidate) => candidate.name === group.now) ??
       rawCandidates.find((candidate) => candidate.name === group.now) ?? { name: group.now }
@@ -357,6 +402,7 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
       currentRegion: currentRegion?.name,
       buckets: bucketResult.buckets,
       unknownProxies: bucketResult.unknownProxies,
+      excludedProxies: bucketResult.excludedProxies,
       lastError: undefined
     })
 
@@ -374,24 +420,36 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
   async function checkOneProxy(
     proxy: AutoSwitchCandidateProxy,
     maxDelayMs: number,
+    testUrl?: string,
+    retryTimeoutOnce = false
+  ): Promise<IProxyAutoSwitchDelayEntry> {
+    const first = await checkOneProxyOnce(proxy, maxDelayMs, testUrl)
+    let finalEntry = first
+
+    if ((first.delay <= 0 || first.error) && retryTimeoutOnce) {
+      // 后台候选节点测速偶发 timeout/0ms 往往来自网络瞬时抖动或并发压测，
+      // 不一定代表节点真实不可用。已返回明确高延迟的节点不重试，避免慢节点放大后台压力。
+      finalEntry = await checkOneProxyOnce(proxy, maxDelayMs, testUrl)
+    }
+
+    state = {
+      ...state,
+      lastDelays: { ...state.lastDelays, [proxy.name]: finalEntry }
+    }
+    return finalEntry
+  }
+
+  async function checkOneProxyOnce(
+    proxy: AutoSwitchCandidateProxy,
+    maxDelayMs: number,
     testUrl?: string
   ): Promise<IProxyAutoSwitchDelayEntry> {
     const time = now().toISOString()
     try {
       const result = await deps.mihomoProxyDelay(proxy.name, testUrl, proxy.provider)
-      const entry = delayEntryFromResult(result, maxDelayMs, time)
-      state = {
-        ...state,
-        lastDelays: { ...state.lastDelays, [proxy.name]: entry }
-      }
-      return entry
+      return delayEntryFromResult(result, maxDelayMs, time)
     } catch (error) {
-      const entry = delayEntryFromResult(undefined, maxDelayMs, time, `${error}`)
-      state = {
-        ...state,
-        lastDelays: { ...state.lastDelays, [proxy.name]: entry }
-      }
-      return entry
+      return delayEntryFromResult(undefined, maxDelayMs, time, `${error}`)
     }
   }
 
@@ -400,10 +458,11 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
     candidates: AutoSwitchCandidateProxy[],
     testUrl?: string
   ): Promise<void> {
-    const appConfig = await deps.getAppConfig()
-    const concurrency = Math.min(Math.max(appConfig.delayTestConcurrency ?? 50, 1), 20)
+    // 自动切换是后台故障判断，和用户手动“全量测速”的吞吐目标不同。
+    // 使用独立的小并发可减少 #1507 类高并发误超时，避免把可用节点误判为不可用。
+    const concurrency = Math.min(Math.max(configValue.delayConcurrency, 1), 20)
     await runWithConcurrency(candidates, concurrency, async (candidate) => {
-      await checkOneProxy(candidate, configValue.maxDelayMs, testUrl)
+      await checkOneProxy(candidate, configValue.maxDelayMs, testUrl, configValue.retryTimeoutOnce)
     })
   }
 
@@ -512,7 +571,10 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
       const entry = await checkOneProxy(
         context.current,
         configValue.maxDelayMs,
-        context.group.testUrl
+        context.group.testUrl,
+        // 当前正在使用的节点是故障转移触发器：这里不重试，避免一次 active 检查
+        // 被额外 timeout 拉长。误判风险由 consecutive failure threshold 吸收。
+        false
       )
       const shouldSwitch = markActiveResult(configValue, context.current, entry)
       if (shouldSwitch) await switchToBestCandidate(configValue, context)
@@ -541,10 +603,12 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
     }
   }
 
-  function scheduleActive(configValue: IProxyAutoSwitchConfig): void {
+  function scheduleActive(configValue: IProxyAutoSwitchConfig, generation = timerGeneration): void {
     activeTimer = setTimer(() => {
       void runActiveCheck(configValue).finally(() => {
-        if (state.running) scheduleActive(configValue)
+        // restart() 会 stop 后立刻 start。旧检查完成时如果只看 state.running，
+        // 会把旧 timer 链接到新运行周期，造成重复调度。generation 用来隔离运行周期。
+        if (state.running && generation === timerGeneration) scheduleActive(configValue, generation)
       })
     }, configValue.activeIntervalSec * 1000)
     publish({
@@ -554,10 +618,15 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
     })
   }
 
-  function scheduleStandby(configValue: IProxyAutoSwitchConfig): void {
+  function scheduleStandby(
+    configValue: IProxyAutoSwitchConfig,
+    generation = timerGeneration
+  ): void {
     standbyTimer = setTimer(() => {
       void runStandbyCheck(configValue).finally(() => {
-        if (state.running) scheduleStandby(configValue)
+        if (state.running && generation === timerGeneration) {
+          scheduleStandby(configValue, generation)
+        }
       })
     }, configValue.standbyIntervalSec * 1000)
     publish({
@@ -568,6 +637,7 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
   }
 
   async function start(): Promise<IProxyAutoSwitchState> {
+    timerGeneration += 1
     stopTimers()
     const configValue = await config()
     if (!configValue.enabled) {
@@ -581,12 +651,14 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
     }
 
     publish({ running: true, paused: false, lastError: undefined })
-    scheduleActive(configValue)
-    scheduleStandby(configValue)
+    const generation = timerGeneration
+    scheduleActive(configValue, generation)
+    scheduleStandby(configValue, generation)
     return cloneState(state)
   }
 
   function stop(): IProxyAutoSwitchState {
+    timerGeneration += 1
     stopTimers()
     checkingActive = false
     checkingStandby = false
@@ -621,7 +693,12 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
       stop()
       return await start()
     },
-    runCheck
+    runCheck,
+    recordRecovery: (action: ProxyAutoSwitchRecoveryAction, at = now()) =>
+      publish({
+        lastRecoveryAt: at.toISOString(),
+        lastRecoveryAction: action
+      })
   }
 }
 
@@ -657,4 +734,10 @@ export async function runAutoProxySwitchCheck(
   reason: AutoProxySwitchCheckReason = 'manual'
 ): Promise<IProxyAutoSwitchState> {
   return await service.runCheck(reason)
+}
+
+export function recordAutoProxySwitchRecovery(
+  action: ProxyAutoSwitchRecoveryAction
+): IProxyAutoSwitchState {
+  return service.recordRecovery(action)
 }

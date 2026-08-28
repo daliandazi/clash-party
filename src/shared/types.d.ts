@@ -274,6 +274,9 @@ interface IProxyAutoSwitchConfig {
   maxDelayMs: number
   failureThreshold: number
   closeConnectionsOnSwitch: boolean
+  delayConcurrency: number
+  retryTimeoutOnce: boolean
+  excludePatterns: string[]
   regions: IProxyAutoSwitchRegion[]
 }
 
@@ -289,6 +292,13 @@ interface IProxyAutoSwitchBucket {
   name: string
   proxies: string[]
 }
+
+interface IProxyAutoSwitchExcludedProxy {
+  name: string
+  pattern: string
+}
+
+type ProxyAutoSwitchRecoveryAction = 'resume-check-ok' | 'resume-core-restart'
 
 interface IProxyAutoSwitchState {
   running: boolean
@@ -308,7 +318,17 @@ interface IProxyAutoSwitchState {
   lastDelays: Record<string, IProxyAutoSwitchDelayEntry>
   buckets: IProxyAutoSwitchBucket[]
   unknownProxies: string[]
+  excludedProxies?: IProxyAutoSwitchExcludedProxy[]
+  lastRecoveryAt?: string
+  lastRecoveryAction?: ProxyAutoSwitchRecoveryAction
   lastError?: string
+}
+
+interface IRuntimeDiagnosticsConfig {
+  enabled: boolean
+  intervalSec: number
+  logMemory: boolean
+  logCoreState: boolean
 }
 
 interface ICustomTrayIcons {
@@ -417,6 +437,7 @@ interface IAppConfig {
   delayTestTimeout?: number
   networkLatencyTargets?: INetworkLatencyTarget[]
   proxyAutoSwitch?: IProxyAutoSwitchConfig
+  runtimeDiagnostics?: IRuntimeDiagnosticsConfig
   networkIPProvider?: 'ip.sb' | 'ipwho.is' | 'ipapi.is'
   networkInfoCardOrder?: NetworkInfoCardKey[]
   subscriptionTimeout?: number

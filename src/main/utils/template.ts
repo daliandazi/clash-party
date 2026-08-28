@@ -64,12 +64,21 @@ export const defaultConfig: IAppConfig = {
     maxDelayMs: 800,
     failureThreshold: 2,
     closeConnectionsOnSwitch: true,
+    delayConcurrency: 4,
+    retryTimeoutOnce: true,
+    excludePatterns: [],
     regions: [
       { id: 'us', name: '美国', patterns: ['US', '美国', 'United States'], enabled: true },
       { id: 'jp', name: '日本', patterns: ['JP', '日本', 'Japan'], enabled: true },
       { id: 'sg', name: '新加坡', patterns: ['SG', '新加坡', 'Singapore'], enabled: true },
       { id: 'hk', name: '香港', patterns: ['HK', '香港', 'Hong Kong'], enabled: true }
     ]
+  },
+  runtimeDiagnostics: {
+    enabled: true,
+    intervalSec: 300,
+    logMemory: true,
+    logCoreState: true
   },
   networkInfoCardOrder: DEFAULT_NETWORK_INFO_CARD_ORDER,
   useNameserverPolicy: DEFAULT_USE_NAMESERVER_POLICY,

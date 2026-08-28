@@ -40,14 +40,60 @@ const DEFAULT_CONFIG: IProxyAutoSwitchConfig = {
   maxDelayMs: 800,
   failureThreshold: 2,
   closeConnectionsOnSwitch: true,
+  delayConcurrency: 4,
+  retryTimeoutOnce: true,
+  excludePatterns: [],
   regions: DEFAULT_REGIONS
+}
+
+function clampNumber(value: unknown, fallback: number, min: number, max?: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+  const clamped = Math.max(Math.floor(value), min)
+  return typeof max === 'number' ? Math.min(clamped, max) : clamped
+}
+
+function normalizePatterns(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((pattern) => String(pattern).trim()).filter(Boolean) : []
+}
+
+function defaultRegions(): IProxyAutoSwitchRegion[] {
+  return DEFAULT_REGIONS.map((region) => ({ ...region, patterns: [...region.patterns] }))
+}
+
+function normalizeRegions(value: unknown): IProxyAutoSwitchRegion[] {
+  if (!Array.isArray(value) || value.length === 0) return defaultRegions()
+
+  const regions = value
+    .filter((region): region is Partial<IProxyAutoSwitchRegion> => Boolean(region))
+    .map((region) => ({
+      id: String(region.id || '').trim(),
+      name: String(region.name || region.id || '').trim(),
+      patterns: normalizePatterns(region.patterns),
+      enabled: region.enabled !== false
+    }))
+    .filter((region) => region.id && region.name)
+
+  return regions.length > 0 ? regions : defaultRegions()
 }
 
 function normalizeConfig(config?: Partial<IProxyAutoSwitchConfig>): IProxyAutoSwitchConfig {
   return {
     ...DEFAULT_CONFIG,
     ...config,
-    regions: config?.regions?.length ? config.regions : DEFAULT_REGIONS
+    activeIntervalSec: clampNumber(config?.activeIntervalSec, DEFAULT_CONFIG.activeIntervalSec, 5),
+    standbyIntervalSec: clampNumber(
+      config?.standbyIntervalSec,
+      DEFAULT_CONFIG.standbyIntervalSec,
+      30
+    ),
+    switchCooldownSec: clampNumber(config?.switchCooldownSec, DEFAULT_CONFIG.switchCooldownSec, 30),
+    maxDelayMs: clampNumber(config?.maxDelayMs, DEFAULT_CONFIG.maxDelayMs, 1),
+    failureThreshold: clampNumber(config?.failureThreshold, DEFAULT_CONFIG.failureThreshold, 1),
+    closeConnectionsOnSwitch: config?.closeConnectionsOnSwitch !== false,
+    delayConcurrency: clampNumber(config?.delayConcurrency, DEFAULT_CONFIG.delayConcurrency, 1, 20),
+    retryTimeoutOnce: config?.retryTimeoutOnce !== false,
+    excludePatterns: normalizePatterns(config?.excludePatterns),
+    regions: normalizeRegions(config?.regions)
   }
 }
 
@@ -86,6 +132,14 @@ function matchRegion(
   return undefined
 }
 
+function matchPattern(value: string, patterns: string[]): string | undefined {
+  for (const pattern of patterns) {
+    const regex = compilePattern(pattern)
+    if (regex?.test(value)) return pattern
+  }
+  return undefined
+}
+
 function nextRegionId(): string {
   return `region-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
@@ -115,8 +169,15 @@ const AutoSwitchModal: React.FC<AutoSwitchModalProps> = (props) => {
       .map((region) => ({ id: region.id, name: region.name, proxies: [] as string[] }))
     const bucketMap = new Map(buckets.map((bucket) => [bucket.id, bucket]))
     const unknown: string[] = []
+    const excluded: IProxyAutoSwitchExcludedProxy[] = []
 
     selectedGroup?.all.forEach((proxy) => {
+      const excludedBy = matchPattern(proxy.name, draft.excludePatterns)
+      if (excludedBy) {
+        excluded.push({ name: proxy.name, pattern: excludedBy })
+        return
+      }
+
       const region = matchRegion(proxy.name, draft.regions)
       if (!region) {
         unknown.push(proxy.name)
@@ -125,17 +186,21 @@ const AutoSwitchModal: React.FC<AutoSwitchModalProps> = (props) => {
       bucketMap.get(region.id)?.proxies.push(proxy.name)
     })
 
-    return { buckets, unknown }
-  }, [draft.regions, selectedGroup])
+    return { buckets, unknown, excluded }
+  }, [draft.excludePatterns, draft.regions, selectedGroup])
 
   const invalidPatterns = useMemo(
-    () =>
-      draft.regions.flatMap((region) =>
+    () => [
+      ...draft.regions.flatMap((region) =>
         region.patterns
           .filter((pattern) => !isValidPattern(pattern))
           .map((pattern) => `${region.name}: ${pattern}`)
       ),
-    [draft.regions]
+      ...draft.excludePatterns
+        .filter((pattern) => !isValidPattern(pattern))
+        .map((pattern) => `${t('proxies.autoSwitch.excludePatterns')}: ${pattern}`)
+    ],
+    [draft.excludePatterns, draft.regions, t]
   )
 
   const patchDraft = (patch: Partial<IProxyAutoSwitchConfig>): void => {
@@ -198,6 +263,12 @@ const AutoSwitchModal: React.FC<AutoSwitchModalProps> = (props) => {
             >
               {t('proxies.autoSwitch.closeConnections')}
             </Switch>
+            <Switch
+              isSelected={draft.retryTimeoutOnce}
+              onValueChange={(retryTimeoutOnce) => patchDraft({ retryTimeoutOnce })}
+            >
+              {t('proxies.autoSwitch.retryTimeoutOnce')}
+            </Switch>
             <Select
               size="sm"
               label={t('proxies.autoSwitch.targetGroup')}
@@ -218,6 +289,19 @@ const AutoSwitchModal: React.FC<AutoSwitchModalProps> = (props) => {
               value={String(draft.maxDelayMs)}
               onValueChange={(value) =>
                 patchDraft({ maxDelayMs: Math.max(parseInt(value) || 1, 1) })
+              }
+            />
+            <Input
+              size="sm"
+              type="number"
+              min={1}
+              max={20}
+              label={t('proxies.autoSwitch.delayConcurrency')}
+              value={String(draft.delayConcurrency)}
+              onValueChange={(value) =>
+                patchDraft({
+                  delayConcurrency: Math.min(Math.max(parseInt(value) || 4, 1), 20)
+                })
               }
             />
             <Input
@@ -257,6 +341,15 @@ const AutoSwitchModal: React.FC<AutoSwitchModalProps> = (props) => {
               }
             />
           </div>
+
+          <Textarea
+            size="sm"
+            minRows={2}
+            label={t('proxies.autoSwitch.excludePatterns')}
+            placeholder={t('proxies.autoSwitch.excludePatternsPlaceholder')}
+            value={draft.excludePatterns.join('\n')}
+            onValueChange={(value) => patchDraft({ excludePatterns: parsePatterns(value) })}
+          />
 
           <Divider />
 
@@ -360,6 +453,15 @@ const AutoSwitchModal: React.FC<AutoSwitchModalProps> = (props) => {
                 </div>
                 <div className="mt-1 max-h-20 overflow-auto text-xs text-foreground-500">
                   {preview.unknown.join(', ') || '-'}
+                </div>
+              </div>
+              <div className="rounded-lg bg-default-100 p-2 text-sm">
+                <div className="font-medium">
+                  {t('proxies.autoSwitch.excluded')} ({preview.excluded.length})
+                </div>
+                <div className="mt-1 max-h-20 overflow-auto text-xs text-foreground-500">
+                  {preview.excluded.map((item) => `${item.name} ← ${item.pattern}`).join(', ') ||
+                    '-'}
                 </div>
               </div>
             </div>

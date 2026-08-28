@@ -4,6 +4,7 @@ import { stat } from 'fs/promises'
 import { existsSync } from 'fs'
 import { app, powerMonitor } from 'electron'
 import { stopCoreForExit, cleanupCoreWatcher } from './core/manager'
+import { handleRuntimeResume } from './core/runtimeHealth'
 import { primeAdminPrivilegesCache } from './core/admin'
 import { triggerSysProxy, disableSysProxySync } from './sys/sysproxy'
 import { exePath } from './utils/dirs'
@@ -149,6 +150,10 @@ export function setupAppLifecycle(): void {
   powerMonitor.on('shutdown', async () => {
     await cleanupBeforeExit()
     app.exit()
+  })
+
+  powerMonitor.on('resume', () => {
+    void handleRuntimeResume()
   })
 
   app.on('will-quit', () => {
