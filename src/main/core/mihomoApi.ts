@@ -205,6 +205,12 @@ export async function mihomoVersion(): Promise<IMihomoVersion> {
   return await instance.get('/version')
 }
 
+// 获取核心实际运行时配置（包含端口绑定状态等）
+export async function getMihomoRuntimeConfig(): Promise<Partial<IMihomoConfig>> {
+  const instance = await getAxios()
+  return (await instance.get('/configs')).data
+}
+
 export const patchMihomoConfig = async (patch: Partial<IMihomoConfig>): Promise<void> => {
   const patchConfig = async (): Promise<void> => {
     const instance = await getAxios()

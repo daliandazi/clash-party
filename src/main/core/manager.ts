@@ -43,7 +43,8 @@ import {
   stopMihomoLogs,
   stopMihomoMemory,
   patchMihomoConfig,
-  getAxios
+  getAxios,
+  getMihomoRuntimeConfig
 } from './mihomoApi'
 import { generateProfile } from './factory'
 import {
@@ -557,6 +558,51 @@ function spawnCoreProcess(config: CoreConfig): ChildProcess {
   return proc
 }
 
+// 验证 mixed-port 是否绑定成功，失败时重试 PATCH
+// 场景：旧进程退出后端口处于 TIME_WAIT，新核心启动时绑定失败
+async function verifyPortBinding(): Promise<void> {
+  const { 'mixed-port': expectedPort } = await getControledMihomoConfig()
+  if (!expectedPort) return
+
+  const MAX_RETRIES = 3
+  const BASE_DELAY_MS = 1000
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const runtimeConfig = await getMihomoRuntimeConfig()
+    const actualPort = runtimeConfig['mixed-port']
+
+    if (actualPort === expectedPort) {
+      if (attempt > 1) {
+        managerLogger.info(`mixed-port ${expectedPort} bound successfully on attempt ${attempt}`)
+      }
+      return
+    }
+
+    managerLogger.warn(
+      `mixed-port mismatch: expected ${expectedPort}, got ${actualPort} (attempt ${attempt}/${MAX_RETRIES})`
+    )
+
+    await new Promise((r) => setTimeout(r, BASE_DELAY_MS * attempt))
+
+    try {
+      // 直接用 axios 而非 patchMihomoConfig，避免触发 restartCore 逻辑
+      const instance = await getAxios()
+      await instance.patch('/configs', { 'mixed-port': expectedPort })
+    } catch (e) {
+      managerLogger.warn(`PATCH mixed-port failed on attempt ${attempt}:`, e)
+    }
+  }
+
+  // 最终检查
+  const finalConfig = await getMihomoRuntimeConfig()
+  if (finalConfig['mixed-port'] !== expectedPort) {
+    managerLogger.error(
+      `Failed to bind mixed-port ${expectedPort} after ${MAX_RETRIES} retries, ` +
+        `current port: ${finalConfig['mixed-port']}. System proxy may not work.`
+    )
+  }
+}
+
 // 设置核心进程事件监听
 function setupCoreListeners(
   proc: ChildProcess,
@@ -608,6 +654,11 @@ function setupCoreListeners(
       managerLogger.warn('Failed to sync runtime config to Gist', error)
     }
     await patchMihomoConfig({ 'log-level': logLevel })
+
+    // 异步验证 mixed-port 绑定，不阻塞启动流程
+    verifyPortBinding().catch((e) => {
+      managerLogger.warn('Port binding verification failed:', e)
+    })
   }
 
   proc.on('close', async (code, signal) => {
