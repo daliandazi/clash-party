@@ -19,6 +19,10 @@ function formatDelay(state?: IProxyAutoSwitchState): string | undefined {
   return entry.alive ? `${entry.delay}ms` : 'Timeout'
 }
 
+function hasMultipleGroups(state?: IProxyAutoSwitchState): boolean {
+  return (state?.groupStates?.length ?? 0) > 1
+}
+
 function recoveryActionKey(action: ProxyAutoSwitchRecoveryAction): string {
   return `proxies.autoSwitch.recovery.${action}`
 }
@@ -46,26 +50,40 @@ const AutoSwitchStatus: React.FC<AutoSwitchStatusProps> = (props) => {
                   ? t('proxies.autoSwitch.paused')
                   : t('proxies.autoSwitch.disabled')}
             </Chip>
-            {state?.currentGroup ? (
-              <span className="text-foreground-500">
-                {t('proxies.autoSwitch.group')}: {state.currentGroup}
-              </span>
-            ) : null}
-            {state?.currentProxy ? (
-              <span className="max-w-64 truncate text-foreground-500">
-                {t('proxies.autoSwitch.current')}: {state.currentProxy}
-              </span>
-            ) : null}
-            {state?.currentRegion ? (
-              <span className="text-foreground-500">
-                {t('proxies.autoSwitch.region')}: {state.currentRegion}
-              </span>
-            ) : null}
-            {delay ? (
-              <span className="text-foreground-500">
-                {t('proxies.autoSwitch.lastDelay')}: {delay}
-              </span>
-            ) : null}
+            {hasMultipleGroups(state) ? (
+              <>
+                {state?.groupStates?.map((gs) => (
+                  <span key={gs.group} className="max-w-64 truncate text-foreground-500">
+                    [{gs.group}] {gs.currentProxy ?? '-'}
+                    {gs.lastDelay ? ` (${gs.lastDelay})` : ''}
+                    {gs.lastError ? ` ⚠ ${gs.lastError}` : ''}
+                  </span>
+                ))}
+              </>
+            ) : (
+              <>
+                {state?.currentGroup ? (
+                  <span className="text-foreground-500">
+                    {t('proxies.autoSwitch.group')}: {state.currentGroup}
+                  </span>
+                ) : null}
+                {state?.currentProxy ? (
+                  <span className="max-w-64 truncate text-foreground-500">
+                    {t('proxies.autoSwitch.current')}: {state.currentProxy}
+                  </span>
+                ) : null}
+                {state?.currentRegion ? (
+                  <span className="text-foreground-500">
+                    {t('proxies.autoSwitch.region')}: {state.currentRegion}
+                  </span>
+                ) : null}
+                {delay ? (
+                  <span className="text-foreground-500">
+                    {t('proxies.autoSwitch.lastDelay')}: {delay}
+                  </span>
+                ) : null}
+              </>
+            )}
             {state?.excludedProxies?.length ? (
               <span className="text-foreground-500">
                 {t('proxies.autoSwitch.excluded')}: {state.excludedProxies.length}

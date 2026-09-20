@@ -34,6 +34,9 @@ const DEFAULT_REGIONS: IProxyAutoSwitchRegion[] = [
 const DEFAULT_CONFIG: IProxyAutoSwitchConfig = {
   enabled: false,
   targetGroup: '',
+  targetGroups: [],
+  loadBalanceMode: false,
+  loadBalanceGroupName: '自动切换-负载均衡',
   activeIntervalSec: 15,
   standbyIntervalSec: 300,
   switchCooldownSec: 180,
@@ -80,6 +83,11 @@ function normalizeConfig(config?: Partial<IProxyAutoSwitchConfig>): IProxyAutoSw
   return {
     ...DEFAULT_CONFIG,
     ...config,
+    loadBalanceMode: config?.loadBalanceMode === true,
+    loadBalanceGroupName:
+      typeof config?.loadBalanceGroupName === 'string' && config.loadBalanceGroupName.trim()
+        ? config.loadBalanceGroupName.trim()
+        : DEFAULT_CONFIG.loadBalanceGroupName,
     activeIntervalSec: clampNumber(config?.activeIntervalSec, DEFAULT_CONFIG.activeIntervalSec, 5),
     standbyIntervalSec: clampNumber(
       config?.standbyIntervalSec,
@@ -157,10 +165,18 @@ const AutoSwitchModal: React.FC<AutoSwitchModalProps> = (props) => {
     if (isOpen) setDraft(normalizeConfig(appConfig?.proxyAutoSwitch))
   }, [appConfig?.proxyAutoSwitch, isOpen])
 
-  const effectiveTargetGroup = draft.targetGroup || groups[0]?.name || ''
-  const selectedGroup = useMemo(
-    () => groups.find((group) => group.name === effectiveTargetGroup) ?? groups[0],
-    [effectiveTargetGroup, groups]
+  const effectiveTargetGroups = useMemo(() => {
+    if (draft.targetGroups && draft.targetGroups.length > 0) return draft.targetGroups
+    if (draft.targetGroup) return [draft.targetGroup]
+    return groups[0] ? [groups[0].name] : []
+  }, [draft.targetGroups, draft.targetGroup, groups])
+
+  const selectedGroups = useMemo(
+    () =>
+      effectiveTargetGroups
+        .map((name) => groups.find((group) => group.name === name))
+        .filter(Boolean) as IMihomoMixedGroup[],
+    [effectiveTargetGroups, groups]
   )
 
   const preview = useMemo(() => {
@@ -171,23 +187,25 @@ const AutoSwitchModal: React.FC<AutoSwitchModalProps> = (props) => {
     const unknown: string[] = []
     const excluded: IProxyAutoSwitchExcludedProxy[] = []
 
-    selectedGroup?.all.forEach((proxy) => {
-      const excludedBy = matchPattern(proxy.name, draft.excludePatterns)
-      if (excludedBy) {
-        excluded.push({ name: proxy.name, pattern: excludedBy })
-        return
-      }
+    for (const selectedGroup of selectedGroups) {
+      selectedGroup.all.forEach((proxy) => {
+        const excludedBy = matchPattern(proxy.name, draft.excludePatterns)
+        if (excludedBy) {
+          excluded.push({ name: proxy.name, pattern: excludedBy })
+          return
+        }
 
-      const region = matchRegion(proxy.name, draft.regions)
-      if (!region) {
-        unknown.push(proxy.name)
-        return
-      }
-      bucketMap.get(region.id)?.proxies.push(proxy.name)
-    })
+        const region = matchRegion(proxy.name, draft.regions)
+        if (!region) {
+          unknown.push(proxy.name)
+          return
+        }
+        bucketMap.get(region.id)?.proxies.push(proxy.name)
+      })
+    }
 
     return { buckets, unknown, excluded }
-  }, [draft.excludePatterns, draft.regions, selectedGroup])
+  }, [draft.excludePatterns, draft.regions, selectedGroups])
 
   const invalidPatterns = useMemo(
     () => [
@@ -230,10 +248,15 @@ const AutoSwitchModal: React.FC<AutoSwitchModalProps> = (props) => {
     if (invalidPatterns.length > 0) return
     setSaving(true)
     try {
+      const targetGroups =
+        draft.targetGroups && draft.targetGroups.length > 0
+          ? draft.targetGroups
+          : effectiveTargetGroups
       await patchAppConfig({
         proxyAutoSwitch: {
           ...draft,
-          targetGroup: draft.targetGroup || groups[0]?.name || ''
+          targetGroups,
+          targetGroup: targetGroups[0] || ''
         }
       })
       await restartAutoProxySwitch()
@@ -269,13 +292,28 @@ const AutoSwitchModal: React.FC<AutoSwitchModalProps> = (props) => {
             >
               {t('proxies.autoSwitch.retryTimeoutOnce')}
             </Switch>
+            <Switch
+              isSelected={draft.loadBalanceMode ?? false}
+              onValueChange={(loadBalanceMode) => patchDraft({ loadBalanceMode })}
+            >
+              {t('proxies.autoSwitch.loadBalanceMode')}
+            </Switch>
+            {draft.loadBalanceMode ? (
+              <Input
+                size="sm"
+                label={t('proxies.autoSwitch.loadBalanceGroupName')}
+                value={draft.loadBalanceGroupName ?? ''}
+                onValueChange={(loadBalanceGroupName) => patchDraft({ loadBalanceGroupName })}
+              />
+            ) : null}
             <Select
               size="sm"
+              selectionMode="multiple"
               label={t('proxies.autoSwitch.targetGroup')}
-              selectedKeys={effectiveTargetGroup ? new Set([effectiveTargetGroup]) : new Set()}
+              selectedKeys={new Set(effectiveTargetGroups)}
               onSelectionChange={(keys) => {
-                const targetGroup = keys.currentKey ?? ''
-                patchDraft({ targetGroup })
+                const selected = [...keys] as string[]
+                patchDraft({ targetGroups: selected, targetGroup: selected[0] || '' })
               }}
             >
               {groups.map((group) => (

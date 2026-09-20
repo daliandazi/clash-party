@@ -6,6 +6,13 @@ import {
   mihomoGroups,
   mihomoProxyDelay
 } from './mihomoApi'
+import {
+  addOverrideItem,
+  removeOverrideItem,
+  getOverrideItem,
+  setOverride
+} from '../config/override'
+import { generateProfile } from './factory'
 
 export interface AutoSwitchCandidateProxy {
   name: string
@@ -38,6 +45,9 @@ export interface AutoProxySwitchDeps {
 export const DEFAULT_AUTO_SWITCH_CONFIG: IProxyAutoSwitchConfig = {
   enabled: false,
   targetGroup: '',
+  targetGroups: [],
+  loadBalanceMode: false,
+  loadBalanceGroupName: '自动切换-负载均衡',
   activeIntervalSec: 15,
   standbyIntervalSec: 300,
   switchCooldownSec: 180,
@@ -96,6 +106,14 @@ export function normalizeAutoSwitchConfig(
     ...value,
     enabled: value?.enabled === true,
     targetGroup: value?.targetGroup ?? defaults.targetGroup,
+    targetGroups: Array.isArray(value?.targetGroups)
+      ? value.targetGroups.map((name) => String(name).trim()).filter(Boolean)
+      : (defaults.targetGroups ?? []),
+    loadBalanceMode: value?.loadBalanceMode === true,
+    loadBalanceGroupName:
+      typeof value?.loadBalanceGroupName === 'string' && value.loadBalanceGroupName.trim()
+        ? value.loadBalanceGroupName.trim()
+        : defaults.loadBalanceGroupName,
     activeIntervalSec: clampNumber(
       value?.activeIntervalSec,
       defaults.activeIntervalSec,
@@ -235,6 +253,16 @@ export function chooseBestCandidate(
   return undefined
 }
 
+function effectiveTargetGroupNames(config: IProxyAutoSwitchConfig): string[] {
+  if (config.targetGroups && config.targetGroups.length > 0) return config.targetGroups
+  if (config.targetGroup) return [config.targetGroup]
+  return []
+}
+
+function failureKey(groupName: string, proxyName: string): string {
+  return `${groupName}::${proxyName}`
+}
+
 function initialState(): IProxyAutoSwitchState {
   return {
     running: false,
@@ -256,7 +284,8 @@ function cloneState(state: IProxyAutoSwitchState): IProxyAutoSwitchState {
     lastDelays: { ...state.lastDelays },
     buckets: state.buckets.map((bucket) => ({ ...bucket, proxies: [...bucket.proxies] })),
     unknownProxies: [...state.unknownProxies],
-    excludedProxies: state.excludedProxies?.map((item) => ({ ...item }))
+    excludedProxies: state.excludedProxies?.map((item) => ({ ...item })),
+    groupStates: state.groupStates?.map((gs) => ({ ...gs }))
   }
 }
 
@@ -320,6 +349,67 @@ async function runWithConcurrency<T>(
   await Promise.all(workers)
 }
 
+export const LOAD_BALANCE_OVERRIDE_ID = 'auto-switch-lb-override'
+
+function buildLoadBalanceOverrideScript(
+  groupName: string,
+  proxyNames: string[],
+  testUrl?: string
+): string {
+  const escapedGroupName = JSON.stringify(groupName)
+  const escapedProxies = JSON.stringify(proxyNames)
+  const testUrlLine = testUrl ? `\n      'url': ${JSON.stringify(testUrl)},` : ''
+  return `function main(config) {
+  var groupName = ${escapedGroupName};
+  var proxies = ${escapedProxies};
+  if (!Array.isArray(config['proxy-groups'])) config['proxy-groups'] = [];
+  var existing = config['proxy-groups'].findIndex(function(g) { return g.name === groupName; });
+  var group = {
+    name: groupName,
+    type: 'load-balance',
+    proxies: proxies,
+    strategy: 'consistent-hashing',${testUrlLine}
+    'lazy': false
+  };
+  if (existing >= 0) {
+    config['proxy-groups'][existing] = group;
+  } else {
+    config['proxy-groups'].push(group);
+  }
+  return config;
+}
+`
+}
+
+async function upsertLoadBalanceOverride(
+  groupName: string,
+  proxyNames: string[],
+  testUrl?: string
+): Promise<void> {
+  const script = buildLoadBalanceOverrideScript(groupName, proxyNames, testUrl)
+  const existing = await getOverrideItem(LOAD_BALANCE_OVERRIDE_ID)
+  if (existing) {
+    await setOverride(LOAD_BALANCE_OVERRIDE_ID, 'js', script)
+  } else {
+    await addOverrideItem({
+      id: LOAD_BALANCE_OVERRIDE_ID,
+      type: 'local',
+      ext: 'js',
+      name: '自动切换-负载均衡',
+      global: true,
+      file: script
+    })
+  }
+  await generateProfile()
+}
+
+async function removeLoadBalanceOverride(): Promise<void> {
+  const existing = await getOverrideItem(LOAD_BALANCE_OVERRIDE_ID)
+  if (!existing) return
+  await removeOverrideItem(LOAD_BALANCE_OVERRIDE_ID)
+  await generateProfile()
+}
+
 export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
   getState: () => IProxyAutoSwitchState
   start: () => Promise<IProxyAutoSwitchState>
@@ -362,21 +452,23 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
   }
 
   async function loadTargetGroupContext(
-    configValue: IProxyAutoSwitchConfig
+    configValue: IProxyAutoSwitchConfig,
+    groupName?: string
   ): Promise<TargetGroupContext | undefined> {
-    if (!configValue.targetGroup) {
+    const targetName = groupName || configValue.targetGroup
+    if (!targetName) {
       publish({ running: configValue.enabled, paused: true, lastError: '未选择目标代理组' })
       return undefined
     }
 
     const groups = await deps.mihomoGroups(true)
-    const group = groups.find((item) => item.name === configValue.targetGroup)
+    const group = groups.find((item) => item.name === targetName)
     if (!group) {
       publish({
         running: configValue.enabled,
         paused: true,
-        currentGroup: configValue.targetGroup,
-        lastError: '目标代理组不存在'
+        currentGroup: targetName,
+        lastError: `目标代理组 ${targetName} 不存在`
       })
       return undefined
     }
@@ -469,15 +561,17 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
   function markActiveResult(
     configValue: IProxyAutoSwitchConfig,
     proxy: AutoSwitchCandidateProxy,
-    entry: IProxyAutoSwitchDelayEntry
+    entry: IProxyAutoSwitchDelayEntry,
+    groupName: string
   ): boolean {
-    const previousFailures = state.consecutiveFailures[proxy.name] ?? 0
+    const key = failureKey(groupName, proxy.name)
+    const previousFailures = state.consecutiveFailures[key] ?? 0
     const nextFailures = entry.alive ? 0 : previousFailures + 1
     state = {
       ...state,
       consecutiveFailures: {
         ...state.consecutiveFailures,
-        [proxy.name]: nextFailures
+        [key]: nextFailures
       },
       lastActiveCheckAt: entry.time
     }
@@ -535,7 +629,7 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
       )
       if (!selected) continue
 
-      await deps.mihomoChangeProxy(configValue.targetGroup || context.group.name, selected.name)
+      await deps.mihomoChangeProxy(context.group.name, selected.name)
       if (configValue.closeConnectionsOnSwitch) {
         await deps.mihomoCloseAllConnections()
       }
@@ -544,10 +638,10 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
         currentProxy: selected.name,
         currentRegion: region.name,
         lastSwitchAt: now().toISOString(),
-        lastSwitchReason: `${context.current.name} 连续失败，切换到 ${selected.name}`,
+        lastSwitchReason: `[${context.group.name}] ${context.current.name} 连续失败，切换到 ${selected.name}`,
         consecutiveFailures: {
           ...state.consecutiveFailures,
-          [selected.name]: 0
+          [failureKey(context.group.name, selected.name)]: 0
         },
         lastError: undefined
       })
@@ -555,6 +649,11 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
     }
 
     publish({ lastError: '没有可用候选节点' })
+  }
+
+  function formatDelay(entry?: IProxyAutoSwitchDelayEntry): string | undefined {
+    if (!entry) return undefined
+    return entry.alive ? `${entry.delay}ms` : 'Timeout'
   }
 
   async function runActiveCheck(
@@ -565,20 +664,50 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
     publish({ checkingActive: true })
 
     try {
-      const context = await loadTargetGroupContext(configValue)
-      if (!context) return cloneState(state)
+      const groupNames = effectiveTargetGroupNames(configValue)
+      if (groupNames.length === 0) {
+        publish({ running: configValue.enabled, paused: true, lastError: '未选择目标代理组' })
+        return cloneState(state)
+      }
 
-      const entry = await checkOneProxy(
-        context.current,
-        configValue.maxDelayMs,
-        context.group.testUrl,
-        // 当前正在使用的节点是故障转移触发器：这里不重试，避免一次 active 检查
-        // 被额外 timeout 拉长。误判风险由 consecutive failure threshold 吸收。
-        false
-      )
-      const shouldSwitch = markActiveResult(configValue, context.current, entry)
-      if (shouldSwitch) await switchToBestCandidate(configValue, context)
-      return publish({ lastActiveCheckAt: entry.time })
+      const groupStates: IProxyAutoSwitchGroupState[] = []
+      let lastTime: string | undefined
+
+      for (const groupName of groupNames) {
+        const context = await loadTargetGroupContext(configValue, groupName)
+        if (!context) {
+          groupStates.push({ group: groupName, lastError: `代理组 ${groupName} 不可用` })
+          continue
+        }
+
+        const entry = await checkOneProxy(
+          context.current,
+          configValue.maxDelayMs,
+          context.group.testUrl,
+          false
+        )
+        lastTime = entry.time
+        const shouldSwitch = markActiveResult(configValue, context.current, entry, groupName)
+        if (shouldSwitch) await switchToBestCandidate(configValue, context)
+
+        const currentEntry = state.lastDelays[context.current.name]
+        groupStates.push({
+          group: groupName,
+          currentProxy: state.currentProxy ?? context.current.name,
+          currentRegion: state.currentRegion ?? context.currentRegion?.name,
+          lastDelay: formatDelay(currentEntry),
+          lastError: state.lastError
+        })
+      }
+
+      if (groupNames.length === 1) {
+        return publish({ lastActiveCheckAt: lastTime, groupStates })
+      }
+      return publish({
+        lastActiveCheckAt: lastTime,
+        currentGroup: groupNames.join(', '),
+        groupStates
+      })
     } finally {
       checkingActive = false
       publish({ checkingActive: false })
@@ -593,9 +722,17 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
     publish({ checkingStandby: true })
 
     try {
-      const context = await loadTargetGroupContext(configValue)
-      if (!context) return cloneState(state)
-      await checkCandidatesWithLimit(configValue, context.candidates, context.group.testUrl)
+      const groupNames = effectiveTargetGroupNames(configValue)
+      if (groupNames.length === 0) {
+        publish({ running: configValue.enabled, paused: true, lastError: '未选择目标代理组' })
+        return cloneState(state)
+      }
+
+      for (const groupName of groupNames) {
+        const context = await loadTargetGroupContext(configValue, groupName)
+        if (!context) continue
+        await checkCandidatesWithLimit(configValue, context.candidates, context.group.testUrl)
+      }
       return publish({ lastStandbyCheckAt: now().toISOString() })
     } finally {
       checkingStandby = false
@@ -647,7 +784,54 @@ export function createAutoProxySwitchService(deps: AutoProxySwitchDeps): {
         paused: false,
         lastError: undefined
       }
+      // 禁用时清理 LoadBalance 覆写（fire-and-forget）
+      removeLoadBalanceOverride().catch(() => {})
       return publish()
+    }
+
+    // 如果开启了负载均衡模式，先构建候选节点列表再生成覆写
+    if (configValue.loadBalanceMode) {
+      const groupNames = effectiveTargetGroupNames(configValue)
+      if (groupNames.length > 0) {
+        try {
+          const groups = await deps.mihomoGroups(true)
+          const proxyNames: string[] = []
+          const testUrl = groups.find((g) => groupNames.includes(g.name))?.testUrl
+          for (const groupName of groupNames) {
+            const group = groups.find((g) => g.name === groupName)
+            if (!group) continue
+            for (const member of group.all) {
+              const candidate = toCandidateProxy(member)
+              if (!candidate) continue
+              const excluded = configValue.excludePatterns.some((p) => {
+                try {
+                  const escaped = p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                  return new RegExp(
+                    p.startsWith('/') ? p.slice(1, p.lastIndexOf('/')) : escaped,
+                    'i'
+                  ).test(candidate.name)
+                } catch {
+                  return false
+                }
+              })
+              if (!excluded && !proxyNames.includes(candidate.name)) {
+                proxyNames.push(candidate.name)
+              }
+            }
+          }
+          if (proxyNames.length > 0) {
+            upsertLoadBalanceOverride(
+              configValue.loadBalanceGroupName || '自动切换-负载均衡',
+              proxyNames,
+              testUrl
+            ).catch(() => {})
+          }
+        } catch {
+          // 节点获取失败不阻塞启动
+        }
+      }
+    } else {
+      removeLoadBalanceOverride().catch(() => {})
     }
 
     publish({ running: true, paused: false, lastError: undefined })

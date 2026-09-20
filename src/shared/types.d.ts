@@ -268,6 +268,9 @@ interface IProxyAutoSwitchRegion {
 interface IProxyAutoSwitchConfig {
   enabled: boolean
   targetGroup?: string
+  targetGroups?: string[]
+  loadBalanceMode?: boolean
+  loadBalanceGroupName?: string
   activeIntervalSec: number
   standbyIntervalSec: number
   switchCooldownSec: number
@@ -300,6 +303,14 @@ interface IProxyAutoSwitchExcludedProxy {
 
 type ProxyAutoSwitchRecoveryAction = 'resume-check-ok' | 'resume-core-restart'
 
+interface IProxyAutoSwitchGroupState {
+  group: string
+  currentProxy?: string
+  currentRegion?: string
+  lastDelay?: string
+  lastError?: string
+}
+
 interface IProxyAutoSwitchState {
   running: boolean
   paused: boolean
@@ -322,6 +333,7 @@ interface IProxyAutoSwitchState {
   lastRecoveryAt?: string
   lastRecoveryAction?: ProxyAutoSwitchRecoveryAction
   lastError?: string
+  groupStates?: IProxyAutoSwitchGroupState[]
 }
 
 interface IRuntimeDiagnosticsConfig {
